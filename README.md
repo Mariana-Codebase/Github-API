@@ -93,3 +93,11 @@ Content-Type: application/json
 ### Docs
 
 Full API reference: `docs/API.md`
+
+
+
+## ⚖️ License
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+This project is under the **MIT License**. 
