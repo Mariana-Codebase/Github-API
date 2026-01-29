@@ -133,16 +133,9 @@ export default async function handler(req: any, res: any) {
 
     const repos = (await response.json()) as GithubRepo[];
 
-    // Filter + map only the fields we actually want to expose.
+    // Filter repos first (before fetching languages to reduce API calls)
     const filtered = repos
       .filter((repo) => !repo.fork && !repo.archived && !repo.disabled)
-      .filter((repo) => {
-        if (languages.length === 0) return true;
-        const lang = repo.language ?? "";
-        return languages.some(
-          (item) => item.toLowerCase() === lang.toLowerCase()
-        );
-      })
       .filter((repo) => {
         if (topics.length === 0) return true;
         const repoTopics = repo.topics ?? [];
@@ -167,11 +160,73 @@ export default async function handler(req: any, res: any) {
         if (updatedUntil && updatedAt > updatedUntil) return false;
         return true;
       })
-      .slice(0, limit)
-      .map((repo) => ({
+      .slice(0, limit);
+
+    // Fetch languages for each filtered repo in parallel
+    const reposWithLanguages = await Promise.all(
+      filtered.map(async (repo) => {
+        let repoLanguages: Record<string, number> = {};
+        let primaryLanguage: string | null = repo.language ?? null;
+
+        try {
+          const langController = new AbortController();
+          const langTimeout = setTimeout(() => langController.abort(), FETCH_TIMEOUT_MS);
+          
+          const langResponse = await fetch(
+            `https://api.github.com/repos/${encodeURIComponent(user)}/${encodeURIComponent(repo.name)}/languages`,
+            {
+              headers,
+              signal: langController.signal
+            }
+          );
+          clearTimeout(langTimeout);
+
+          if (langResponse.ok) {
+            repoLanguages = (await langResponse.json()) as Record<string, number>;
+            // Get the primary language (highest byte count)
+            const sortedLanguages = Object.entries(repoLanguages).sort(
+              (a, b) => b[1] - a[1]
+            );
+            if (sortedLanguages.length > 0) {
+              primaryLanguage = sortedLanguages[0][0];
+            }
+          }
+        } catch (error) {
+          // If language fetch fails, fall back to repo.language
+          // This is not critical, so we continue
+        }
+
+        return {
+          repo,
+          languages: repoLanguages,
+          primaryLanguage
+        };
+      })
+    );
+
+    // Filter by language if specified (now using fetched languages)
+    const finalFiltered = reposWithLanguages
+      .filter(({ primaryLanguage, languages: repoLanguages }) => {
+        if (languages.length === 0) return true;
+        
+        // Check if any requested language matches
+        return languages.some((lang) => {
+          const langLower = lang.toLowerCase();
+          // Check primary language
+          if (primaryLanguage && langLower === primaryLanguage.toLowerCase()) {
+            return true;
+          }
+          // Check all languages in the repo
+          return Object.keys(repoLanguages).some(
+            (repoLang) => repoLang.toLowerCase() === langLower
+          );
+        });
+      })
+      .map(({ repo, languages, primaryLanguage }) => ({
         name: repo.name,
         description: repo.description ?? "",
-        language: repo.language ?? "Unknown",
+        language: primaryLanguage ?? "Unknown",
+        languages: Object.keys(languages), // Array of all languages
         url: repo.html_url,
         updatedAt: repo.updated_at,
         stars: repo.stargazers_count,
@@ -184,7 +239,7 @@ export default async function handler(req: any, res: any) {
 
     // Small cache so this endpoint is fast on repeat calls.
     res.setHeader("Cache-Control", "s-maxage=600, stale-while-revalidate=3600");
-    res.status(200).json({ user, projects: filtered });
+    res.status(200).json({ user, projects: finalFiltered });
   } catch (error: any) {
     if (error?.name === "AbortError") {
       res.status(504).json({ error: "GitHub API timed out." });
