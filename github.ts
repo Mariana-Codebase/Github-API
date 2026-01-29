@@ -162,6 +162,19 @@ export default async function handler(req: any, res: any) {
       })
       .slice(0, limit);
 
+    // Helper function to calculate language percentages
+    const calculatePercentages = (langs: Record<string, number>) => {
+      const totalBytes = Object.values(langs).reduce((sum, bytes) => sum + bytes, 0);
+      if (totalBytes === 0) return {};
+      
+      const percentages: Record<string, number> = {};
+      for (const [lang, bytes] of Object.entries(langs)) {
+        // Round to 1 decimal place for cleaner output
+        percentages[lang] = Math.round((bytes / totalBytes) * 1000) / 10;
+      }
+      return percentages;
+    };
+
     // Fetch languages for each filtered repo in parallel
     const reposWithLanguages = await Promise.all(
       filtered.map(async (repo) => {
@@ -196,9 +209,12 @@ export default async function handler(req: any, res: any) {
           // This is not critical, so we continue
         }
 
+        const languagePercentages = calculatePercentages(repoLanguages);
+
         return {
           repo,
           languages: repoLanguages,
+          languagePercentages,
           primaryLanguage
         };
       })
@@ -206,7 +222,7 @@ export default async function handler(req: any, res: any) {
 
     // Filter by language if specified (now using fetched languages)
     const finalFiltered = reposWithLanguages
-      .filter(({ primaryLanguage, languages: repoLanguages }) => {
+      .filter(({ primaryLanguage, languagePercentages }) => {
         if (languages.length === 0) return true;
         
         // Check if any requested language matches
@@ -217,16 +233,16 @@ export default async function handler(req: any, res: any) {
             return true;
           }
           // Check all languages in the repo
-          return Object.keys(repoLanguages).some(
+          return Object.keys(languagePercentages).some(
             (repoLang) => repoLang.toLowerCase() === langLower
           );
         });
       })
-      .map(({ repo, languages, primaryLanguage }) => ({
+      .map(({ repo, languagePercentages, primaryLanguage }) => ({
         name: repo.name,
         description: repo.description ?? "",
         language: primaryLanguage ?? "Unknown",
-        languages: Object.keys(languages), // Array of all languages
+        languages: languagePercentages, // Object with language names as keys and percentages as values
         url: repo.html_url,
         updatedAt: repo.updated_at,
         stars: repo.stargazers_count,
