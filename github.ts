@@ -44,6 +44,13 @@ const buildGithubUrl = (user: string) => {
   return `https://api.github.com/users/${encodeURIComponent(user)}/repos?${params.toString()}`;
 };
 
+const parseProjectTypeFromReadme = (readmeText: string) => {
+  const firstLine = readmeText.split(/\r?\n/, 1)[0]?.trim() ?? "";
+  if (!firstLine.startsWith("//")) return undefined;
+  const tag = firstLine.slice(2).trim();
+  return tag.length > 0 ? tag : undefined;
+};
+
 type GithubRepo = {
   name: string;
   description: string | null;
@@ -180,6 +187,7 @@ export default async function handler(req: any, res: any) {
       filtered.map(async (repo) => {
         let repoLanguages: Record<string, number> = {};
         let primaryLanguage: string | null = repo.language ?? null;
+        let projectType: string | undefined;
 
         try {
           const langController = new AbortController();
@@ -211,11 +219,39 @@ export default async function handler(req: any, res: any) {
 
         const languagePercentages = calculatePercentages(repoLanguages);
 
+        try {
+          const readmeController = new AbortController();
+          const readmeTimeout = setTimeout(
+            () => readmeController.abort(),
+            FETCH_TIMEOUT_MS
+          );
+
+          const readmeResponse = await fetch(
+            `https://api.github.com/repos/${encodeURIComponent(user)}/${encodeURIComponent(repo.name)}/readme`,
+            {
+              headers: {
+                ...headers,
+                Accept: "application/vnd.github.raw+json"
+              },
+              signal: readmeController.signal
+            }
+          );
+          clearTimeout(readmeTimeout);
+
+          if (readmeResponse.ok) {
+            const readmeText = await readmeResponse.text();
+            projectType = parseProjectTypeFromReadme(readmeText);
+          }
+        } catch (error) {
+          // If README fetch fails, just skip the project type.
+        }
+
         return {
           repo,
           languages: repoLanguages,
           languagePercentages,
-          primaryLanguage
+          primaryLanguage,
+          projectType
         };
       })
     );
@@ -238,11 +274,12 @@ export default async function handler(req: any, res: any) {
           );
         });
       })
-      .map(({ repo, languagePercentages, primaryLanguage }) => ({
+      .map(({ repo, languagePercentages, primaryLanguage, projectType }) => ({
         name: repo.name,
         description: repo.description ?? "",
         language: primaryLanguage ?? "Unknown",
         languages: languagePercentages, // Object with language names as keys and percentages as values
+        projectType,
         url: repo.html_url,
         updatedAt: repo.updated_at,
         stars: repo.stargazers_count,

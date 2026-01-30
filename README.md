@@ -1,3 +1,5 @@
+//API
+
 ### GitHub Repos API
 
 A small API that fetches GitHub repositories for a user, applies filters, and
@@ -77,6 +79,12 @@ Content-Type: application/json
       "name": "repo-name",
       "description": "short text",
       "language": "TypeScript",
+      "languages": {
+        "TypeScript": 81.1,
+        "CSS": 18.6,
+        "HTML": 0.3
+      },
+      "projectType": "WEB",
       "url": "https://github.com/octocat/repo-name",
       "updatedAt": "2025-01-01T12:00:00Z",
       "stars": 10,

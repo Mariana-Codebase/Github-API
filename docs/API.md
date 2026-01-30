@@ -84,6 +84,12 @@ The response is always JSON with a `user` and a `projects` array.
       "name": "repo-name",
       "description": "short text",
       "language": "TypeScript",
+      "languages": {
+        "TypeScript": 81.1,
+        "CSS": 18.6,
+        "HTML": 0.3
+      },
+      "projectType": "WEB",
       "url": "https://github.com/octocat/repo-name",
       "updatedAt": "2025-01-01T12:00:00Z",
       "stars": 10,
@@ -103,6 +109,8 @@ The response is always JSON with a `user` and a `projects` array.
 - `defaultBranch` is usually `main` or `master`.
 - `topics` can be empty if the repo has none.
 - `size` is the GitHub repo size in KB.
+- `languages` returns percentages per language from the README language stats.
+- `projectType` is read from the first README line when it starts with `//`.
 
 ## Error Responses
 
