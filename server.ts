@@ -1,5 +1,6 @@
 import express from "express";
-import handler from "./github";
+import githubHandler from "./github";
+import contributionsHandler from "./contributions";
 
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
@@ -9,7 +10,8 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Everything goes through the same handler for GET and POST.
-app.all("/api/github", (req, res) => handler(req, res));
+app.all("/api/github", (req, res) => githubHandler(req, res));
+app.all("/api/contributions", (req, res) => contributionsHandler(req, res));
 
 // A tiny health check so I know the server is up.
 app.get("/", (_req, res) => {

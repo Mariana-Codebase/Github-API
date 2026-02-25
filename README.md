@@ -17,6 +17,7 @@ that cleanup for you and gives you a short list that is ready to render.
 - Filters: language, topics, size, stars, updated date range
 - Includes metrics: stars, forks, open issues, default branch
 - Optional GitHub token to avoid rate limits
+- Contributions endpoint for PR activity
 
 ### Tech Stack
 
@@ -40,6 +41,11 @@ npm run dev
 3) Try a quick request
 ```
 http://localhost:3000/api/github?user=octocat
+```
+
+4) Contributions example
+```
+http://localhost:3000/api/contributions?user=octocat&since=2025-01-01&includeRefs=1
 ```
 
 ### Environment Variables

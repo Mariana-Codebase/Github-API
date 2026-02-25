@@ -1,0 +1,554 @@
+const DEFAULT_LIMIT = 6;
+const CACHE_TTL_MS = 2 * 60 * 1000;
+const responseCache = new Map<string, { expiresAt: number; data: unknown }>();
+const timelineCache = new Map<string, { expiresAt: number; data: Array<{ url: string; reference: string; author: string; event: string; createdAt?: string }> }>();
+const releaseCache = new Map<string, { expiresAt: number; data: { name?: string; tag?: string; url?: string } | null }>();
+const MAX_TIMELINE_PAGES = 10;
+
+const parseLimit = (value: string | undefined) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_LIMIT;
+  return Math.min(parsed, 50);
+};
+
+const parseIncludeRefs = (value: string | undefined) => {
+  if (!value) return true;
+  const normalized = value.toLowerCase();
+  return normalized !== "0" && normalized !== "false";
+};
+
+const parseSince = (value: string | undefined) => {
+  if (!value) return undefined;
+  const normalized = value.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) return undefined;
+  return normalized;
+};
+
+const parseFresh = (value: string | undefined) => {
+  if (!value) return false;
+  const normalized = value.toLowerCase();
+  return normalized === "1" || normalized === "true";
+};
+
+const parseClearCache = (value: string | undefined) => {
+  if (!value) return false;
+  const normalized = value.toLowerCase();
+  return normalized === "1" || normalized === "true";
+};
+
+const buildSearchUrl = (user: string, perPage: number, since?: string) => {
+  const sinceFilter = since ? ` created:>=${since}` : "";
+  const params = new URLSearchParams({
+    q: `author:${user} is:pr${sinceFilter} sort:updated-desc`,
+    per_page: String(perPage)
+  });
+
+  return `https://api.github.com/search/issues?${params.toString()}`;
+};
+
+const parseRepoFromUrl = (repoUrl: string) => {
+  const parts = repoUrl.split('/').filter(Boolean);
+  if (parts.length < 2) return { fullName: repoUrl, name: repoUrl };
+  const name = parts[parts.length - 1];
+  const owner = parts[parts.length - 2];
+  return { fullName: `${owner}/${name}`, name };
+};
+
+const parseOwnerRepo = (fullName: string) => {
+  const [owner, repo] = fullName.split('/');
+  if (!owner || !repo) return null;
+  return { owner, repo };
+};
+
+const parseOwnerRepoFromUrl = (url: string) => {
+  const match = url.match(/github\.com\/([^/]+)\/([^/]+)/);
+  if (!match) return null;
+  return { owner: match[1], repo: match[2] };
+};
+
+const normalizeGithubHtmlUrl = (url: string, fallbackOwner: string, fallbackRepo: string, issueNumber: number) => {
+  if (url.includes("github.com/") && !url.includes("api.github.com")) {
+    return url;
+  }
+  const apiMatch = url.match(/api\.github\.com\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)/);
+  if (apiMatch) {
+    return `https://github.com/${apiMatch[1]}/${apiMatch[2]}/issues/${apiMatch[3]}`;
+  }
+  return `https://github.com/${fallbackOwner}/${fallbackRepo}/pull/${issueNumber}`;
+};
+
+const buildCommitHtmlUrl = (commitUrl: string) => {
+  const match = commitUrl.match(/repos\/([^/]+)\/([^/]+)\/commits\/([a-f0-9]+)/i);
+  if (!match) return null;
+  return `https://github.com/${match[1]}/${match[2]}/commit/${match[3]}`;
+};
+
+const buildFallbackPrUrl = (owner: string, repo: string, issueNumber: number) =>
+  `https://github.com/${owner}/${repo}/pull/${issueNumber}`;
+
+const fetchLatestRelease = async (
+  owner: string,
+  repo: string,
+  headers: Record<string, string>,
+  fresh: boolean
+) => {
+  const cacheKey = `${owner}/${repo}`;
+  const now = Date.now();
+  const cached = releaseCache.get(cacheKey);
+  if (!fresh && cached && cached.expiresAt > now) {
+    return cached.data;
+  }
+
+  try {
+    const response = await fetch(
+      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases/latest`,
+      { headers }
+    );
+    if (!response.ok) {
+      releaseCache.set(cacheKey, { expiresAt: now + CACHE_TTL_MS, data: null });
+      return null;
+    }
+    const data = (await response.json()) as { name?: string; tag_name?: string; html_url?: string };
+    const payload = { name: data.name, tag: data.tag_name, url: data.html_url };
+    releaseCache.set(cacheKey, { expiresAt: now + CACHE_TTL_MS, data: payload });
+    return payload;
+  } catch {
+    releaseCache.set(cacheKey, { expiresAt: now + CACHE_TTL_MS, data: null });
+    return null;
+  }
+};
+
+const fetchSearchMentions = async (
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  headers: Record<string, string>
+) => {
+  const query = `repo:${owner}/${repo} is:pr \"${owner}/${repo}#${issueNumber}\" in:title,body,comments`;
+  const url = `https://api.github.com/search/issues?q=${encodeURIComponent(query)}&per_page=50`;
+  const response = await fetch(url, { headers });
+  if (!response.ok) return [];
+  const data = (await response.json()) as {
+    items?: Array<{ html_url: string; user?: { login?: string } }>;
+  };
+  return (data.items ?? []).map((item) => ({
+    url: item.html_url,
+    reference: `${owner}/${repo}`,
+    author: item.user?.login ?? "unknown",
+    event: "mentioned"
+  }));
+};
+
+const fetchGraphqlReferences = async (
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  headers: Record<string, string>
+) => {
+  const graphqlUrl = "https://api.github.com/graphql";
+  const query = `
+    query($owner:String!, $repo:String!, $number:Int!, $after:String) {
+      repository(owner:$owner, name:$repo) {
+        pullRequest(number:$number) {
+          timelineItems(first:100, after:$after, itemTypes:[CROSS_REFERENCED_EVENT, REFERENCED_EVENT, MENTIONED_EVENT]) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              __typename
+              ... on CrossReferencedEvent {
+                actor { login }
+                source {
+                  __typename
+                  ... on PullRequest { url author { login } }
+                  ... on Issue { url author { login } }
+                }
+                createdAt
+              }
+              ... on ReferencedEvent {
+                actor { login }
+                commitUrl
+                createdAt
+              }
+              ... on MentionedEvent {
+                actor { login }
+                createdAt
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const references: Array<{ url: string; reference: string; author: string; event: string; createdAt?: string }> = [];
+  let after: string | null = null;
+
+  while (true) {
+    const response = await fetch(graphqlUrl, {
+      method: "POST",
+      headers: {
+        ...headers,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        query,
+        variables: { owner, repo, number: issueNumber, after }
+      })
+    });
+
+    if (!response.ok) break;
+    const payload = (await response.json()) as any;
+    const timeline = payload?.data?.repository?.pullRequest?.timelineItems;
+    const nodes = timeline?.nodes ?? [];
+
+    for (const node of nodes) {
+      if (node.__typename === "CrossReferencedEvent") {
+        const author = node?.source?.author?.login ?? node?.actor?.login ?? "unknown";
+        const url = node?.source?.url ?? buildFallbackPrUrl(owner, repo, issueNumber);
+        const event = "mentioned";
+        references.push({ url, reference: `${owner}/${repo}`, author, event, createdAt: node?.createdAt });
+      } else if (node.__typename === "ReferencedEvent") {
+        const author = node?.actor?.login ?? "unknown";
+        const url = node?.commitUrl ?? buildFallbackPrUrl(owner, repo, issueNumber);
+        const event = "referenced";
+        references.push({ url, reference: `${owner}/${repo}`, author, event, createdAt: node?.createdAt });
+      } else if (node.__typename === "MentionedEvent") {
+        const author = node?.actor?.login ?? "unknown";
+        const url = buildFallbackPrUrl(owner, repo, issueNumber);
+        const event = "mentioned";
+        references.push({ url, reference: `${owner}/${repo}`, author, event, createdAt: node?.createdAt });
+      }
+    }
+
+    if (!timeline?.pageInfo?.hasNextPage) break;
+    after = timeline.pageInfo.endCursor;
+  }
+
+  return references;
+};
+
+const normalizeReferenceEvent = (event: string) => {
+  if (event === "mentioned") return "mentioned";
+  if (event === "cross-referenced" || event === "referenced") return "referenced";
+  return "referenced";
+};
+
+const fetchTimelineReferences = async (
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  headers: Record<string, string>,
+  fresh: boolean
+) => {
+  const cacheKey = `${owner}/${repo}#${issueNumber}`;
+  const now = Date.now();
+  const cached = timelineCache.get(cacheKey);
+  if (!fresh && cached && cached.expiresAt > now) {
+    return cached.data;
+  }
+  const references: Array<{ url: string; reference: string; author: string; event: string; createdAt?: string }> = [];
+  let page = 1;
+  const perPage = 100;
+
+  while (page <= MAX_TIMELINE_PAGES) {
+    const timelineResponse = await fetch(
+      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issueNumber}/timeline?per_page=${perPage}&page=${page}`,
+      {
+        headers: {
+          ...headers,
+          Accept: "application/vnd.github+json, application/vnd.github.mockingbird-preview+json"
+        }
+      }
+    );
+    if (!timelineResponse.ok) break;
+    const timeline = (await timelineResponse.json()) as Array<{
+      event?: string;
+      url?: string;
+      commit_id?: string;
+      commit_url?: string;
+      created_at?: string;
+      actor?: { login?: string };
+      user?: { login?: string };
+      source?: {
+        issue?: {
+          html_url?: string;
+          number?: number;
+          user?: { login?: string };
+          pull_request?: Record<string, unknown>;
+        };
+      };
+    }>;
+    if (!Array.isArray(timeline) || timeline.length === 0) break;
+    for (const entry of timeline) {
+      let actor =
+        entry.actor?.login ??
+        entry.user?.login ??
+        entry.source?.issue?.user?.login ??
+        "unknown";
+      if (actor === "unknown" && entry.event === "mentioned" && entry.url) {
+        try {
+          const mentionResponse = await fetch(entry.url, { headers });
+          if (mentionResponse.ok) {
+            const mentionData = (await mentionResponse.json()) as { user?: { login?: string } };
+            actor = mentionData.user?.login ?? actor;
+          }
+        } catch {
+          actor = actor;
+        }
+      }
+      if (entry.event === "cross-referenced") {
+        const issue = entry.source?.issue;
+        const issueUrl = issue?.html_url as string | undefined;
+        const repoInfo = issueUrl ? parseOwnerRepoFromUrl(issueUrl) : null;
+        const fallbackUrl = buildFallbackPrUrl(owner, repo, issueNumber);
+        const ref = repoInfo
+          ? `${repoInfo.owner}/${repoInfo.repo}#${issue?.number}`
+          : `${owner}/${repo}#${issueNumber}`;
+        const event = normalizeReferenceEvent("cross-referenced");
+        references.push({
+          url: issueUrl ?? fallbackUrl,
+          reference: ref,
+          author: actor,
+          event,
+          createdAt: entry.created_at
+        });
+        continue;
+      }
+
+      if (entry.event === "referenced") {
+        const commitUrl = entry.commit_url
+          ? buildCommitHtmlUrl(entry.commit_url) ?? entry.commit_url
+          : undefined;
+        const repoInfo = commitUrl ? parseOwnerRepoFromUrl(commitUrl) ?? { owner, repo } : { owner, repo };
+        const ref = entry.commit_id
+          ? `${repoInfo.owner}/${repoInfo.repo}@${String(entry.commit_id).slice(0, 7)}`
+          : `${owner}/${repo}#${issueNumber}`;
+        const event = normalizeReferenceEvent("referenced");
+        references.push({
+          url: commitUrl ?? buildFallbackPrUrl(owner, repo, issueNumber),
+          reference: ref,
+          author: actor,
+          event,
+          createdAt: entry.created_at
+        });
+        continue;
+      }
+
+      if (entry.event === "mentioned") {
+        const rawUrl =
+          (entry.url as string | undefined) ||
+          `https://github.com/${owner}/${repo}/pull/${issueNumber}`;
+        const mentionUrl = normalizeGithubHtmlUrl(rawUrl, owner, repo, issueNumber);
+        const repoInfo = parseOwnerRepoFromUrl(mentionUrl) ?? { owner, repo };
+        const ref = `${repoInfo.owner}/${repoInfo.repo}`;
+        const event = normalizeReferenceEvent("mentioned");
+        references.push({ url: mentionUrl, reference: ref, author: actor, event, createdAt: entry.created_at });
+      }
+    }
+    if (timeline.length < perPage) break;
+    page += 1;
+  }
+
+  timelineCache.set(cacheKey, { expiresAt: now + CACHE_TTL_MS, data: references });
+  try {
+    const graphqlRefs = await fetchGraphqlReferences(owner, repo, issueNumber, headers);
+    const searchRefs = await fetchSearchMentions(owner, repo, issueNumber, headers);
+    return references.concat(graphqlRefs, searchRefs);
+  } catch {
+    return references;
+  }
+};
+
+export default async function handler(req: any, res: any) {
+  const user =
+    typeof req.query?.user === "string"
+      ? req.query.user
+      : (typeof (globalThis as any).process !== "undefined"
+          ? (globalThis as any).process.env.GITHUB_USER
+          : undefined);
+
+  const limit = parseLimit(
+    typeof req.query?.limit === "string" ? req.query.limit : undefined
+  );
+  const includeRefs = parseIncludeRefs(
+    typeof req.query?.includeRefs === "string" ? req.query.includeRefs : undefined
+  );
+  const since = parseSince(
+    typeof req.query?.since === "string" ? req.query.since : undefined
+  );
+  const fresh = parseFresh(
+    typeof req.query?.fresh === "string" ? req.query.fresh : undefined
+  );
+  const clearCache = parseClearCache(
+    typeof req.query?.clearCache === "string" ? req.query.clearCache : undefined
+  );
+
+  if (clearCache) {
+    responseCache.clear();
+    timelineCache.clear();
+  }
+
+  if (!user) {
+    res.status(400).json({ error: "Missing GitHub user." });
+    return;
+  }
+
+  const token =
+    typeof (globalThis as any).process !== "undefined"
+      ? (globalThis as any).process.env?.GITHUB_TOKEN
+      : undefined;
+  const headers: Record<string, string> = {
+    Accept: "application/vnd.github+json",
+    "User-Agent": "portfolio-site"
+  };
+
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  const cacheKey = `${user}:${limit}:${includeRefs ? "refs" : "norefs"}:${since ?? "all"}`;
+  const now = Date.now();
+  const cached = responseCache.get(cacheKey);
+  if (!fresh && cached && cached.expiresAt > now) {
+    res.setHeader("Cache-Control", "s-maxage=600, stale-while-revalidate=3600");
+    res.status(200).json(cached.data);
+    return;
+  }
+
+  try {
+    const searchResponse = await fetch(buildSearchUrl(user, 50, since), { headers });
+    if (!searchResponse.ok) {
+      const message = await searchResponse.text();
+      res.status(searchResponse.status).json({ error: message || "GitHub API error" });
+      return;
+    }
+
+    const searchData = (await searchResponse.json()) as {
+      items: Array<{
+        html_url: string;
+        number: number;
+        state: "open" | "closed";
+        repository_url: string;
+        pull_request?: { url: string };
+        title?: string;
+      }>;
+    };
+
+    const repoCache = new Map<string, { name: string; fullName: string; stars: number; owner: string }>();
+    const contributions: Array<{
+      status: "OPEN" | "MERGED";
+      project: string;
+      title: string;
+      stars: number;
+      url: string;
+      reference: string;
+      owner: string;
+      references: Array<{ url: string; reference: string; author: string; event: string; createdAt?: string }>;
+      release?: { name?: string; tag?: string; url?: string } | null;
+    }> = [];
+
+    for (const item of searchData.items ?? []) {
+      if (contributions.length >= limit) break;
+      if (!item.pull_request?.url) continue;
+
+      let status: "OPEN" | "MERGED" | null = null;
+      if (item.state === "open") {
+        status = "OPEN";
+      } else if (item.state === "closed") {
+        try {
+          const prResponse = await fetch(item.pull_request.url, { headers });
+          if (prResponse.ok) {
+            const prData = (await prResponse.json()) as { merged_at: string | null };
+            if (prData.merged_at) status = "MERGED";
+          }
+        } catch {
+          status = null;
+        }
+      }
+
+      if (!status) continue;
+
+      const repoUrl = item.repository_url;
+      let repoData = repoCache.get(repoUrl);
+      if (!repoData) {
+        try {
+          const repoResponse = await fetch(repoUrl, { headers });
+          if (repoResponse.ok) {
+            const repoJson = (await repoResponse.json()) as {
+              name: string;
+              full_name: string;
+              stargazers_count: number;
+              owner: { login: string };
+            };
+            repoData = {
+              name: repoJson.name,
+              fullName: repoJson.full_name,
+              stars: repoJson.stargazers_count,
+              owner: repoJson.owner.login
+            };
+          }
+        } catch {
+          repoData = undefined;
+        }
+
+        if (!repoData) {
+          const parsed = parseRepoFromUrl(repoUrl);
+          const owner = parsed.fullName.split('/')[0] ?? parsed.fullName;
+          repoData = { name: parsed.name, fullName: parsed.fullName, stars: 0, owner };
+        }
+
+        repoCache.set(repoUrl, repoData);
+      }
+
+      if (repoData.owner?.toLowerCase() === user.toLowerCase()) {
+        continue;
+      }
+
+      let references: Array<{ url: string; reference: string; author: string; event: string; createdAt?: string }> = [];
+      let release: { name?: string; tag?: string; url?: string } | null = null;
+      if (includeRefs) {
+        const ownerRepo = parseOwnerRepo(repoData.fullName);
+        if (ownerRepo) {
+          try {
+            const allRefs = await fetchTimelineReferences(
+              ownerRepo.owner,
+              ownerRepo.repo,
+              item.number,
+              headers,
+              fresh
+            );
+            references = allRefs.filter(
+              (issue) => issue.author.toLowerCase() !== user.toLowerCase()
+            );
+          } catch {
+            references = [];
+          }
+
+          try {
+            release = await fetchLatestRelease(ownerRepo.owner, ownerRepo.repo, headers, fresh);
+          } catch {
+            release = null;
+          }
+        }
+      }
+
+      contributions.push({
+        status,
+        project: repoData.name,
+        title: item.title ?? "",
+        stars: repoData.stars,
+        url: item.html_url,
+        reference: `${repoData.fullName}#${item.number}`,
+        owner: repoData.owner,
+        references,
+        release
+      });
+    }
+
+    const payload = { user, contributions };
+    responseCache.set(cacheKey, { expiresAt: now + CACHE_TTL_MS, data: payload });
+    res.setHeader("Cache-Control", "s-maxage=600, stale-while-revalidate=3600");
+    res.status(200).json(payload);
+  } catch (error) {
+    res.status(500).json({ error: "Unexpected server error." });
+  }
+}

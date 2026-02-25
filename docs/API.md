@@ -15,6 +15,7 @@ http://localhost:3000
 ```
 GET  /api/github
 POST /api/github
+GET  /api/contributions
 ```
 
 You can use **GET** with query parameters or **POST** with a JSON body.
@@ -37,6 +38,46 @@ You can send them as query params (GET) or in the JSON body (POST).
 | `max_stars` | number | `100` | Maximum stars. |
 | `updated_since` | date | `2024-01-01` | Only repos updated after this date. |
 | `updated_until` | date | `2024-12-31` | Only repos updated before this date. |
+
+## Contributions Endpoint
+
+```
+GET /api/contributions
+```
+
+### Parameters (query)
+
+| Name | Type | Example | What it does |
+| --- | --- | --- | --- |
+| `user` | string | `octocat` | GitHub username to fetch. |
+| `limit` | number | `6` | Max results returned. Default 6, max 50. |
+| `since` | date | `2025-01-01` | Only PRs created after this date. |
+| `includeRefs` | boolean | `1` | Include referenced/mentioned users (default true). |
+| `fresh` | boolean | `1` | Skip cache and refresh GitHub data. |
+| `clearCache` | boolean | `1` | Clear API cache before responding. |
+
+### Response (contributions)
+
+```
+{
+  "user": "octocat",
+  "contributions": [
+    {
+      "status": "MERGED",
+      "project": "repo-name",
+      "title": "fix(ui): ...",
+      "stars": 10,
+      "url": "https://github.com/octocat/repo/pull/123",
+      "reference": "octocat/repo#123",
+      "owner": "octocat",
+      "release": { "name": "Release v1.2.3", "tag": "v1.2.3", "url": "..." },
+      "references": [
+        { "author": "someone", "event": "mentioned", "url": "..." }
+      ]
+    }
+  ]
+}
+```
 
 ### Notes on filters
 
